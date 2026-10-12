@@ -1,10 +1,140 @@
 import 'dart:async';
+import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
-void main() => runApp(const TrackingApp());
+const appVersion = '0.1.0+1';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await initializeService();
+  runApp(const TrackingApp());
+}
+
+Future<void> initializeService() async {
+  final service = FlutterBackgroundService();
+
+  await service.configure(
+    androidConfiguration: AndroidConfiguration(
+      onStart: onServiceStart,
+      autoStart: false,
+      autoStartOnBoot: false,
+      isForegroundMode: true,
+      foregroundServiceTypes: [AndroidForegroundType.location],
+      initialNotificationTitle: 'Tracking aktif',
+      initialNotificationContent: 'Menyiapkan pengiriman lokasi',
+      foregroundServiceNotificationId: 888,
+    ),
+    iosConfiguration: IosConfiguration(
+      autoStart: false,
+      onForeground: onServiceStart,
+    ),
+  );
+}
+
+@pragma('vm:entry-point')
+void onServiceStart(ServiceInstance service) async {
+  DartPluginRegistrant.ensureInitialized();
+
+  Timer? timer;
+
+  Future<void> sendLocation() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final server = p.getString('server') ?? '';
+      final port = int.tryParse(p.getString('port') ?? '') ?? 5055;
+      final device = p.getString('device') ?? '';
+
+      if (server.isEmpty || device.isEmpty) {
+        service.invoke('status', {
+          'message': 'Server dan Device ID wajib diisi',
+        });
+        return;
+      }
+
+      service.invoke('status', {'message': 'Mengambil lokasi...'});
+
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+        ),
+      );
+
+      final uri = Uri(
+        scheme: 'http',
+        host: server,
+        port: port,
+        path: '/',
+        queryParameters: {
+          'id': device,
+          'lat': '${pos.latitude}',
+          'lon': '${pos.longitude}',
+          'speed': '${pos.speed * 3.6}',
+          'accuracy': '${pos.accuracy}',
+          'timestamp': '${DateTime.now().millisecondsSinceEpoch ~/ 1000}',
+        },
+      );
+
+      service.invoke('status', {'message': 'Mengirim ke server...'});
+
+      final response = await http
+          .get(uri)
+          .timeout(const Duration(seconds: 10));
+
+      final message =
+          'Terkirim (${response.statusCode}) '
+          '${pos.latitude.toStringAsFixed(5)}, '
+          '${pos.longitude.toStringAsFixed(5)}';
+
+      service.invoke('status', {'message': message});
+
+      if (service is AndroidServiceInstance) {
+        await service.setForegroundNotificationInfo(
+          title: 'Tracking aktif',
+          content: message,
+        );
+      }
+    } catch (e) {
+      service.invoke('status', {'message': 'Gagal mengirim: $e'});
+    }
+  }
+
+  Future<void> startTracking() async {
+    final p = await SharedPreferences.getInstance();
+    final seconds = (int.tryParse(p.getString('interval') ?? '') ?? 15)
+        .clamp(5, 3600);
+
+    timer?.cancel();
+
+    if (service is AndroidServiceInstance) {
+      await service.setAsForegroundService();
+      await service.setForegroundNotificationInfo(
+        title: 'Tracking aktif',
+        content: 'Mengirim lokasi setiap $seconds detik',
+      );
+    }
+
+    service.invoke('status', {'message': 'Tracking aktif'});
+    await sendLocation();
+    timer = Timer.periodic(Duration(seconds: seconds), (_) => sendLocation());
+  }
+
+  service.on('startTracking').listen((_) {
+    startTracking();
+  });
+
+  service.on('stopTracking').listen((_) async {
+    timer?.cancel();
+    timer = null;
+    service.invoke('status', {'message': 'Berhenti'});
+    await service.stopSelf();
+  });
+
+  await startTracking();
+}
 
 class TrackingApp extends StatelessWidget {
   const TrackingApp({super.key});
@@ -31,13 +161,22 @@ class _TrackingPageState extends State<TrackingPage> {
   final device = TextEditingController();
   final interval = TextEditingController(text: '15');
 
-  Timer? timer;
+  StreamSubscription<Map<String, dynamic>?>? statusSubscription;
   String status = 'Berhenti';
 
   @override
   void initState() {
     super.initState();
     _load();
+    statusSubscription = FlutterBackgroundService()
+        .on('status')
+        .listen((event) {
+      final message = event?['message']?.toString();
+
+      if (message != null && mounted) {
+        setState(() => status = message);
+      }
+    });
   }
 
   Future<void> _load() async {
@@ -45,6 +184,7 @@ class _TrackingPageState extends State<TrackingPage> {
 
     server.text = p.getString('server') ?? '';
     device.text = p.getString('device') ?? '';
+    port.text = p.getString('port') ?? '5055';
     interval.text = p.getString('interval') ?? '15';
   }
 
@@ -71,81 +211,30 @@ class _TrackingPageState extends State<TrackingPage> {
     final p = await SharedPreferences.getInstance();
 
     await p.setString('server', server.text);
+    await p.setString('port', port.text);
     await p.setString('device', device.text);
     await p.setString('interval', interval.text);
 
-    timer?.cancel();
-
-    final seconds = int.tryParse(interval.text) ?? 15;
+    final service = FlutterBackgroundService();
+    final isRunning = await service.isRunning();
 
     setState(() => status = 'Tracking aktif');
-    _send();
 
-    timer = Timer.periodic(
-      Duration(seconds: seconds.clamp(5, 3600)),
-      (_) => _send(),
-    );
-  }
-
-  Future<void> _send() async {
-    try {
-      if (mounted) {
-        setState(() => status = 'Mengambil lokasi...');
-      }
-
-      final pos = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-        ),
-      );
-
-      final uri = Uri(
-        scheme: 'http',
-        host: server.text.trim(),
-        port: int.tryParse(port.text) ?? 5055,
-        path: '/',
-        queryParameters: {
-          'id': device.text.trim(),
-          'lat': '${pos.latitude}',
-          'lon': '${pos.longitude}',
-          'speed': '${pos.speed * 3.6}',
-          'accuracy': '${pos.accuracy}',
-          'timestamp':
-              '${DateTime.now().millisecondsSinceEpoch ~/ 1000}',
-        },
-      );
-
-      if (mounted) {
-        setState(() => status = 'Mengirim ke server...');
-      }
-
-      final response = await http
-          .get(uri)
-          .timeout(const Duration(seconds: 10));
-
-      if (mounted) {
-        setState(
-          () => status =
-              'Terkirim (${response.statusCode}) '
-              '${pos.latitude.toStringAsFixed(5)}, '
-              '${pos.longitude.toStringAsFixed(5)}',
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() => status = 'Gagal mengirim: $e');
-      }
+    if (isRunning) {
+      service.invoke('startTracking');
+    } else {
+      await service.startService();
     }
   }
 
   void _stop() {
-    timer?.cancel();
+    FlutterBackgroundService().invoke('stopTracking');
     setState(() => status = 'Berhenti');
   }
 
   @override
   void dispose() {
-    timer?.cancel();
+    statusSubscription?.cancel();
     server.dispose();
     port.dispose();
     device.dispose();
@@ -200,6 +289,12 @@ class _TrackingPageState extends State<TrackingPage> {
         ),
         const SizedBox(height: 20),
         Text('Status: $status'),
+        const SizedBox(height: 12),
+        Text(
+          'Versi APK: $appVersion',
+          style: Theme.of(c).textTheme.bodySmall,
+          textAlign: TextAlign.center,
+        ),
       ],
     ),
   );
